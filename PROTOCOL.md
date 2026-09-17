@@ -2,7 +2,7 @@
 
 > **Đây là tài liệu giao thức chính thức (nguồn chuẩn duy nhất).**  
 > Mọi thay đổi phải qua Pull Request và được **cả hai thành viên** duyệt.  
-> Phiên bản: **v1** · Cập nhật lần cuối: T1
+> Phiên bản: **v1** · Cập nhật lần cuối: T1 (thêm §3.1 quy tắc phản hồi, §3.2 Envelope sai định dạng; thống nhất `AUTH_FAIL`)
 
 ---
 
@@ -80,7 +80,43 @@ Mọi thông điệp trên kênh control/sync đều là một JSON object với
 | `type` | `string` | ✔ | Tên message type (xem §4). |
 | `id` | `string` | ✔ | Correlation ID. Client dùng tiền tố `c-`, server dùng `s-`. Phản hồi copy lại `id` của yêu cầu. |
 | `ts` | `long` | ✔ | Unix epoch milliseconds (đồng hồ của người gửi). |
-| `body` | `object` | ✔ | Dữ liệu tuỳ theo `type`. Có thể là `{}` nếu không cần thêm trường. |
+| `body` | `object` | ✔ | Dữ liệu tuỳ theo `type`. Có thể là `{}` nếu không cần thêm trường. Bên nhận coi `body` bị thiếu là `{}`. |
+
+### 3.1 Quy tắc phản hồi
+
+Mỗi yêu cầu client gửi (C→S) nhận **đúng một phản hồi kết thúc**, mang **cùng `id`** với yêu cầu:
+
+| Kết quả | `type` của phản hồi | `body` |
+|---------|---------------------|--------|
+| Thành công | **Trùng `type` của yêu cầu** (ví dụ `ROOM_JOIN` → `ROOM_JOIN`) | Dữ liệu kết quả, xem §4 |
+| Thất bại | `ERROR` | `{ "code": 404, "message": "..." }` |
+
+Các yêu cầu có tên phản hồi riêng (đã có sẵn trong `MessageType`):
+
+| Yêu cầu | Thành công | Thất bại |
+|---------|-----------|----------|
+| `REGISTER`, `LOGIN`, `RESUME` | `AUTH_OK` | `AUTH_FAIL` (body giống `ERROR`) |
+| `MSG_SEND` | `MSG_ACK` | `ERROR` |
+| `MSG_HISTORY` | Chuỗi `MSG_DELIVER`, kết thúc bằng `MSG_ACK { "historyEnd": true }` | `ERROR` |
+| `FILE_OFFER` | `FILE_UPLOAD_TOKEN` | `ERROR` |
+| `PING` | `PONG` | — |
+
+Thông điệp server **tự phát**, không phải phản hồi cho yêu cầu nào (`MSG_DELIVER` tin của người khác, `PRESENCE`, `ROOM_MEMBERS`, `FILE_AVAILABLE`), dùng `id` do server sinh với tiền tố `s-`.
+
+### 3.2 Envelope sai định dạng
+
+Bên nhận trả `ERROR 400` và **giữ nguyên kết nối** khi payload:
+
+- không phải JSON object;
+- thiếu hoặc `null` ở `v`, `type`, `id`, `ts`;
+- sai kiểu dữ liệu (ví dụ `ts` là chuỗi, `v` là số thực), hoặc `id` rỗng;
+- có `type` không nằm trong §4, hoặc `v` khác `1`;
+- có `body` nhưng không phải object.
+
+`id` của `ERROR` là `id` của yêu cầu nếu đọc được, nếu không thì server tự sinh `s-…`.
+Trong code: `Json.envelopeFromJson` ném `MalformedEnvelopeException`, lấy `id` bằng `requestId()`.
+
+> Khác với khung dài quá 1 MiB (§2): trường hợp đó luồng byte đã hỏng nên phải đóng kết nối. Envelope sai định dạng chỉ hỏng một thông điệp, các khung sau vẫn đọc được.
 
 ---
 
@@ -107,10 +143,14 @@ Mọi thông điệp trên kênh control/sync đều là một JSON object với
 | `ROOM_LEAVE` | C→S | Rời phòng | `{ "room": "..." }` |
 | `ROOM_MEMBERS` | S→C | Danh sách thành viên phòng (push khi ai vào/ra) | `{ "room": "...", "members": [{ "username": "...", "online": true }] }` |
 
-Phản hồi cho ROOM_LIST, ROOM_CREATE, ROOM_JOIN, ROOM_LEAVE là `AUTH_OK`-style với body phù hợp, hoặc `ERROR`.
+Phản hồi theo quy tắc chung §3.1: thành công trả về **cùng `type` với yêu cầu**, thất bại trả `ERROR`.
 
-> **ROOM_LIST response body:** `{ "rooms": [{ "name": "ltm", "protected": false, "memberCount": 3 }] }`  
-> **ROOM_CREATE/JOIN response body:** `{ "room": "ltm" }` khi thành công, hoặc `ERROR`.
+| Yêu cầu | Body phản hồi khi thành công | Lỗi thường gặp |
+|---------|------------------------------|----------------|
+| `ROOM_LIST` | `{ "rooms": [{ "name": "ltm", "protected": false, "memberCount": 3 }] }` | `401` |
+| `ROOM_CREATE` | `{ "room": "ltm" }` | `401`, `409` phòng đã tồn tại |
+| `ROOM_JOIN` | `{ "room": "ltm" }` | `401`, `403` sai mật khẩu phòng, `404` |
+| `ROOM_LEAVE` | `{ "room": "ltm" }` | `401`, `404` |
 
 ### 4.3 Tin nhắn (Messaging)
 
@@ -178,7 +218,8 @@ Client                          Server
   │                               │  (hash password với BCrypt)
   │                               │  (lưu vào SQLite)
   │◀── AUTH_OK {sessionToken, username} ─│
-  │       hoặc ERROR 409 (đã tồn tại)   │
+  │       hoặc AUTH_FAIL {code: 409}     │  (username đã tồn tại)
+  │       hoặc AUTH_FAIL {code: 400}     │  (username/password sai ràng buộc)
 ```
 
 **Ràng buộc:**
@@ -196,7 +237,7 @@ Client                          Server
   │                               │  (BCrypt.checkpw)
   │                               │  (tạo sessionToken = 32 byte SecureRandom)
   │◀── AUTH_OK {sessionToken, username} ─│
-  │       hoặc ERROR 401                 │
+  │       hoặc AUTH_FAIL {code: 401}     │  (sai username hoặc mật khẩu)
 ```
 
 ### 6.3 Khôi phục phiên (Reconnect / Failover)
@@ -209,6 +250,7 @@ Client                          Server B (sau khi mất kết nối tới A)
   │                               │  (lấy các tin từ A-57 trở đi)
   │◀── AUTH_OK ──────────────────│
   │◀── MSG_DELIVER (tin bị lỡ) ──│  (gửi tuần tự, lọc trùng theo msgId)
+  │       hoặc AUTH_FAIL {code: 401} │  (token hết hạn → client đăng nhập lại)
 ```
 
 ---
@@ -333,7 +375,7 @@ Server đọc tuần tự, kiểm SHA-256 sau khi nhận đủ `size` byte. Kế
 | Tiền tố | Người dùng | Ví dụ |
 |---------|-----------|-------|
 | `c-` | Client | `c-1042` |
-| `s-` | Server (phản hồi) | `s-200` |
+| `s-` | Server — thông điệp server tự phát hoặc `ERROR` không đọc được `id` yêu cầu | `s-200` |
 | `A-` | Server A (message ID) | `A-57` |
 | `B-` | Server B (message ID) | `B-12` |
 
