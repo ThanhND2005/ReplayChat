@@ -22,9 +22,15 @@ package ltm.relaychat.server;
  */
 public class ServerMain {
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
+        for (String arg : args) {
+            if ("--mode=echo".equalsIgnoreCase(arg)) {
+                ltm.relaychat.server.echo.EchoServer.main(args);
+                return;
+            }
+        }
         System.out.println("RelayChat Server – M0 stub");
-        System.out.println("Run with: --mode=iterative|pool|nio --port=9000 --tls --id=A --peer=host:9100");
+        System.out.println("Run with: --mode=iterative|pool|nio|echo --port=9000 --tls --id=A --peer=host:9100");
         // TODO T2: parse args and start the appropriate server model
     }
 }

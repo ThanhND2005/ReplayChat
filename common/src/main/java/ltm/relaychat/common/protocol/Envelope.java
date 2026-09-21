@@ -39,6 +39,14 @@ public record Envelope(
     /** Current protocol version. */
     public static final int PROTOCOL_VERSION = 1;
 
+    public Envelope {
+        java.util.Objects.requireNonNull(type, "type must not be null");
+        java.util.Objects.requireNonNull(id, "id must not be null");
+        if (body == null) {
+            body = new JsonObject();
+        }
+    }
+
     /**
      * Compact factory using the current timestamp.
      *

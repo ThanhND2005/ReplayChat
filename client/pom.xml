@@ -37,6 +37,13 @@
             <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
+
+        <!-- Server module for end-to-end testing -->
+        <dependency>
+            <groupId>ltm.relaychat</groupId>
+            <artifactId>server</artifactId>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>

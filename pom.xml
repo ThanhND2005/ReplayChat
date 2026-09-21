@@ -47,6 +47,16 @@
                 <artifactId>common</artifactId>
                 <version>${project.version}</version>
             </dependency>
+            <dependency>
+                <groupId>ltm.relaychat</groupId>
+                <artifactId>server</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>ltm.relaychat</groupId>
+                <artifactId>client</artifactId>
+                <version>${project.version}</version>
+            </dependency>
 
             <!-- JSON -->
             <dependency>

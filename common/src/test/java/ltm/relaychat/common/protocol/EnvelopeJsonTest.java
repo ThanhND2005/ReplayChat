@@ -95,4 +95,76 @@ class EnvelopeJsonTest {
         assertEquals(MessageType.PONG, parsed.type());
         assertEquals("s-42",           parsed.id());
     }
+
+    @Test
+    void roundTrip_allMessageTypes() {
+        for (MessageType type : MessageType.values()) {
+            JsonObject body = new JsonObject();
+            body.addProperty("testKey", "testVal-" + type.name());
+            Envelope original = Envelope.of(type, "c-" + type.name(), body);
+
+            String json = Json.envelopeToJson(original);
+            Envelope parsed = Json.envelopeFromJson(json);
+
+            assertEquals(original.version(), parsed.version());
+            assertEquals(type, parsed.type());
+            assertEquals("c-" + type.name(), parsed.id());
+            assertEquals("testVal-" + type.name(), parsed.body().get("testKey").getAsString());
+        }
+    }
+
+    @Test
+    void fromJson_missingRequiredFields_throwsIllegalArgumentException() {
+        // Missing 'v'
+        assertThrows(IllegalArgumentException.class, () ->
+                Json.envelopeFromJson("{\"type\":\"PING\",\"id\":\"c-1\",\"ts\":1000,\"body\":{}}"));
+
+        // Missing 'type'
+        assertThrows(IllegalArgumentException.class, () ->
+                Json.envelopeFromJson("{\"v\":1,\"id\":\"c-1\",\"ts\":1000,\"body\":{}}"));
+
+        // Missing 'id'
+        assertThrows(IllegalArgumentException.class, () ->
+                Json.envelopeFromJson("{\"v\":1,\"type\":\"PING\",\"ts\":1000,\"body\":{}}"));
+
+        // Missing 'ts'
+        assertThrows(IllegalArgumentException.class, () ->
+                Json.envelopeFromJson("{\"v\":1,\"type\":\"PING\",\"id\":\"c-1\",\"body\":{}}"));
+    }
+
+    @Test
+    void envelope_nullBody_defaultsToEmptyJsonObject() {
+        Envelope env = new Envelope(1, MessageType.PING, "c-1", 1000L, null);
+        assertNotNull(env.body());
+        assertTrue(env.body().entrySet().isEmpty());
+
+        String json = Json.envelopeToJson(env);
+        Envelope parsed = Json.envelopeFromJson(json);
+        assertNotNull(parsed.body());
+    }
+
+    @Test
+    void envelope_nullTypeOrId_throwsNullPointerException() {
+        assertThrows(NullPointerException.class, () ->
+                new Envelope(1, null, "c-1", 1000L, new JsonObject()));
+        assertThrows(NullPointerException.class, () ->
+                new Envelope(1, MessageType.PING, null, 1000L, new JsonObject()));
+    }
+
+    @Test
+    void roundTrip_vietnameseAndSpecialCharacters() {
+        JsonObject body = new JsonObject();
+        body.addProperty("content", "Xin chào RelayChat! Tiếng Việt có dấu: ă, â, đ, ê, ô, ơ, ư 🌏 🔥 🚀");
+        Envelope original = Envelope.of(MessageType.MSG_SEND, "c-utf8", body);
+
+        byte[] bytes = Json.envelopeToBytes(original);
+        Envelope parsed = Json.envelopeFromBytes(bytes);
+
+        assertEquals(original.type(), parsed.type());
+        assertEquals(original.id(), parsed.id());
+        assertEquals(
+                "Xin chào RelayChat! Tiếng Việt có dấu: ă, â, đ, ê, ô, ơ, ư 🌏 🔥 🚀",
+                parsed.body().get("content").getAsString()
+        );
+    }
 }
