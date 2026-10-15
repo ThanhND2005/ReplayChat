@@ -31,10 +31,12 @@ UDP có thể mất, trùng hoặc đảo thứ tự gói. Báo cáo dùng số 
 
 ## 6. Phác thảo thiết kế
 
-- **Công nghệ đề xuất:** Java 21, Maven; agent Windows native, server có thể chạy Docker.
-- **Giao thức:** LANMON/1, một datagram chứa một phong bì JSON có chữ ký HMAC; tối đa 1.200 byte. Chi tiết: [protocol-design.md](protocol-design.md).
-- **Năm nhóm lệnh đầu:** REGISTER (bắt tay), REPORT (định kỳ), GET_REPORT (lấy ngay), GET_APPS (phân trang), SET_INTERVAL (cấu hình). PING và UNREGISTER hỗ trợ vòng đời.
+- **Transport — giao thức vận chuyển: UDP.** Báo cáo tài nguyên được gửi định kỳ, nên có thể chấp nhận mất một bản cập nhật và chờ bản mới. Các lệnh cần kết quả sẽ được bổ sung phản hồi, timeout, retry và chống thực hiện lặp ở tầng ứng dụng.
+- **Giao thức tầng ứng dụng: LANMON/1**, do nhóm thiết kế để **chạy trên UDP**. LANMON viết tắt của LAN Monitoring, `/1` là phiên bản 1. LANMON/1 quy định cấu trúc thông điệp, các lệnh, quản lý phiên, mã lỗi và xác thực; đây không phải tên khác của UDP hay một giao thức vận chuyển mới.
+- **Framing và định dạng:** mỗi datagram UDP chứa một phong bì JSON UTF-8 có mã xác thực HMAC, tối đa 1.200 byte. Payload JSON được mã hóa base64url để ký trên dữ liệu xác định; base64 không phải mã hóa bảo mật. Chi tiết: [protocol-design.md](protocol-design.md).
+- **Năm nhóm lệnh đầu:** REGISTER (agent → server, bắt tay), REPORT (agent → server, báo cáo định kỳ), GET_REPORT (server → agent, lấy báo cáo ngay), GET_APPS (server → agent, lấy danh sách ứng dụng phân trang), SET_INTERVAL (server → agent, đổi chu kỳ). PING và UNREGISTER hỗ trợ vòng đời.
 - **Đa luồng:** receiver → hàng đợi giới hạn → worker cố định; cập nhật nguyên tử theo agent; sender riêng và console đọc snapshot. Chi tiết: [architecture.md](architecture.md).
+- **Ngôn ngữ và công cụ:** Java 21, Maven; agent Windows native, server đóng gói bằng Docker.
 
 ## 7. Phương án đã cân nhắc
 
@@ -47,14 +49,21 @@ UDP có thể mất, trùng hoặc đảo thứ tự gói. Báo cáo dùng số 
 
 ## 8. Phân công dự kiến
 
-Nhóm tự thống nhất và điền chủ sở hữu các phần server, agent, codec/xác thực, kiểm thử và tài liệu trước khi chốt M1. Chưa gán tên A/B hoặc phần trăm đóng góp. Mỗi người cần có phần triển khai và hiểu thiết kế mình nhận trách nhiệm.
+| Thành viên | Phần sẽ phụ trách (module / tài liệu) |
+|---|---|
+| | |
+| | |
+
+Nhóm tự điền sau khi thống nhất, trước khi chốt M1. Chia theo thành phần hoặc luồng chức năng như server, agent, codec/xác thực kèm kiểm thử và tài liệu tương ứng; không chia thành một người chỉ viết code, một người chỉ viết tài liệu. Mỗi người cần hiểu và giải thích được phần mình nhận trách nhiệm.
 
 ## 9. Rủi ro và kiểm chứng dự kiến
 
-- **Khác biệt API Windows:** biểu diễn metric không hỗ trợ là null, đối chiếu công cụ hệ điều hành; lấy mẫu tiến trình có thể bỏ lỡ ứng dụng mở/đóng nhanh.
-- **Mất gói/quá tải:** test có seed, hàng đợi giới hạn; đo 10/50/100 agent với cấu hình và số lần chạy công khai. Không đặt trước kết quả đạt được.
-- **Dữ liệu riêng và khóa:** agent công khai trên máy được đồng ý; không gửi bí mật vào Git; HMAC không che nội dung khỏi người bắt gói.
-- **Tiến độ:** tuần 1 đề xuất/thiết kế, tuần 2 skeleton Docker (M2), tuần 3–4 chức năng, tuần 5 kiểm thử, tuần 6 hoàn thiện (M3). Hạn chính thức theo LMS, không suy ra từ Excel.
+| Rủi ro | Biện pháp giảm thiểu / kiểm chứng dự kiến |
+|---|---|
+| API Windows không hỗ trợ một số metric; lấy mẫu có thể bỏ lỡ ứng dụng mở/đóng nhanh | Biểu diễn metric không lấy được là null; đối chiếu công cụ hệ điều hành; ghi rõ giới hạn lấy mẫu thay vì khẳng định đã ghi nhận mọi lần mở/đóng. |
+| UDP mất, trùng, đảo thứ tự gói hoặc server quá tải | Dùng phiên, số thứ tự, retry/chống trùng cho lệnh và hàng đợi giới hạn; test lỗi có seed; đo 10/50/100 agent và ghi cấu hình/số lần chạy. Không đặt trước kết quả đạt được. |
+| Thu thập dữ liệu riêng hoặc lộ khóa xác thực | Agent chạy công khai trên máy được đồng ý; không thu website/nội dung/bàn phím; không đưa khóa thật vào Git. HMAC không che nội dung khỏi người bắt gói, nên v1 giới hạn trong LAN được quản lý. |
+| Thiếu thời gian hoàn thành hoặc lệch hạn môn học | Giữ phạm vi một server và console; lịch nội bộ: tuần 1 đề xuất/thiết kế, tuần 2 skeleton Docker (M2), tuần 3–4 chức năng, tuần 5 kiểm thử, tuần 6 hoàn thiện (M3). Hạn chính thức lấy từ LMS, không suy ra từ Excel. |
 
 ## 10. Phản hồi giảng viên
 
