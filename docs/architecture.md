@@ -1,234 +1,178 @@
 # Kiến trúc hệ thống giám sát LAN qua UDP
 
-> Dự thảo v1 · 15/10/2026 · Phương án cho giai đoạn triển khai sau; chưa có số liệu chứng minh hiệu năng. Hợp đồng mạng: [protocol-design.md](protocol-design.md). Phạm vi và lý do bài toán: [proposal.md](proposal.md). Phân công để nhóm tự xác nhận.
+Phiên bản thiết kế: 1.0 — 15/10/2026. Giao thức sử dụng: [LANMON/1 trên UDP](protocol-design.md). Phạm vi hệ thống được trình bày trong [đề xuất đề tài](proposal.md).
 
-## 1. Mô hình tổng thể
+## 1. Mô hình đồng thời
+
+Máy chủ sử dụng mô hình **thread pool kết hợp Producer–Consumer**. Một luồng nhận datagram UDP và đưa vào hàng đợi có giới hạn. Các worker lấy gói từ hàng đợi để xác thực, kiểm tra phiên và cập nhật trạng thái máy. Luồng gửi riêng xử lý các phản hồi và yêu cầu điều khiển agent.
 
 ```mermaid
-flowchart LR
-    subgraph WindowsAgents[Agent Windows native]
-        M[Metric collector]
-        P[Process snapshot collector]
-        C[Command handler]
-        R[Reporter]
-        U[UDP endpoint]
-        M --> R
-        R --> U
-        U --> C
-        C --> P
-        C --> M
-        C --> U
+flowchart TD
+    subgraph Sequential["Xử lý tuần tự"]
+        R1["Nhận datagram"] --> H1["Xử lý xong một gói"] --> R1
     end
-    subgraph MonitorServer[Server Java 21]
-        RX[UDP receiver]
-        Q[Inbound bounded queue]
-        W[Fixed worker pool]
-        S[Session and machine state]
-        A[Alert engine]
-        O[Outbound bounded queue]
-        TX[UDP sender]
-        CLI[Console and request tracker]
-        RX --> Q --> W
-        W --> S
-        W --> A
-        W --> O --> TX
-        CLI --> S
-        CLI --> O
-        W --> CLI
+    subgraph PerAgent["Một luồng cho mỗi agent"]
+        R2["Nhận và phân loại agent"] --> T1["Luồng agent A"]
+        R2 --> T2["Luồng agent B"]
     end
-    U -->|LANMON/1 UDP| RX
-    TX -->|Requests and results| U
+    subgraph Pool["Thread pool - mô hình sử dụng"]
+        R3["UDP receiver"] --> Q3["Hàng đợi có giới hạn"]
+        Q3 --> W1["Worker 1"]
+        Q3 --> WK["Worker K"]
+    end
+    subgraph EventLoop["Vòng lặp sự kiện"]
+        E1["Selector / event loop"] --> E2["Handler không chặn"]
+    end
 ```
 
-Một server quản lý tối đa 100 agent được cấp khóa trước. Agent và server là chương trình độc lập, chỉ giao tiếp qua UDP; không đọc file/trạng thái riêng của nhau. Maven common chỉ tái sử dụng codec/kiểu dữ liệu, không tạo kênh chia sẻ dữ liệu ngoài giao thức. Console quản trị chạy trong tiến trình server; không mở thêm dịch vụ quản trị từ xa.
+| Mô hình | Cách hoạt động | Ưu điểm | Nhược điểm | Công cụ điển hình |
+|---|---|---|---|---|
+| Một luồng cho mỗi agent | Phân loại datagram theo agent rồi giao cho luồng riêng | Tách xử lý giữa các agent | Số luồng tăng theo số agent; UDP không có kết nối để gắn trực tiếp với luồng | Java Thread |
+| Thread pool | Worker cố định nhận tác vụ từ hàng đợi | Giới hạn số luồng và tài nguyên; nhận gói độc lập với xử lý | Cần bảo vệ trạng thái dùng chung và xử lý gói sai thứ tự | ExecutorService, ArrayBlockingQueue |
+| Vòng lặp sự kiện / I/O bất đồng bộ | Điều phối socket không chặn trong vòng lặp sự kiện | Phục vụ nhiều socket với ít luồng | Tác vụ chặn ảnh hưởng vòng lặp; cách tổ chức phức tạp hơn | DatagramChannel, Selector |
 
-## 2. Mô hình đồng thời và lựa chọn
+**Mô hình của hệ thống:** thread pool với 4 worker và hàng đợi nhận 1.024 gói. Lựa chọn này phù hợp với mục tiêu thử nghiệm 10–100 agent, đồng thời cho phép khảo sát ảnh hưởng của số worker khi đo tải. Khi hàng đợi đầy, receiver bỏ gói mới và tăng bộ đếm; không chờ worker hoặc tạo thêm luồng. Agent và server đều dùng hàng đợi gửi có giới hạn 1.024 gói.
 
-**Đề xuất Producer–Consumer với worker cố định.** Receiver chỉ nhận, kiểm chiều dài và copy đúng byte gói vào hàng đợi 1.024 phần tử bằng offer không chờ. Bốn worker lấy gói, kiểm JSON/HMAC, kiểm phiên, cập nhật và lập phản hồi. Đầy queue thì bỏ gói mới, tăng queueDropped. Không dùng executor có hàng đợi vô hạn hoặc tạo một thread cho mỗi datagram.
+Server có luồng nhận, luồng gửi, nhóm worker, bộ lập lịch kiểm tra timeout và luồng đọc console. Agent có bộ thu thập tài nguyên, bộ gửi báo cáo định kỳ và bộ xử lý lệnh. Mỗi tiến trình giữ một socket UDP trong suốt phiên để duy trì cổng nguồn ổn định.
 
-| Phương án | Điểm mạnh | Đánh đổi |
+## 2. Các thành phần
+
+```mermaid
+classDiagram
+    class ServerApplication {
+        +start()
+        +stop()
+    }
+    class UdpReceiver {
+        +receiveLoop()
+    }
+    class WorkerPool {
+        +dispatch(packet)
+    }
+    class SessionRegistry {
+        +register()
+        +updateReport()
+        +expire()
+    }
+    class ProtocolCodec {
+        +encode(message)
+        +decode(bytes)
+    }
+    class RequestTracker {
+        +request()
+        +retry()
+        +complete()
+    }
+    class AgentApplication {
+        +collectMetrics()
+        +handleCommand()
+    }
+    ServerApplication --> UdpReceiver : khởi tạo
+    UdpReceiver --> WorkerPool : chuyển gói qua hàng đợi
+    WorkerPool --> ProtocolCodec : kiểm tra thông điệp
+    WorkerPool --> SessionRegistry : cập nhật trạng thái
+    WorkerPool --> RequestTracker : ghép phản hồi
+    AgentApplication --> ProtocolCodec : mã hóa và giải mã
+```
+
+| Thành phần | Trách nhiệm | Thành viên phụ trách |
 |---|---|---|
-| Xử lý mọi thứ trong receiver | Ít mã và ít khóa | Parse/chữ ký/xử lý chậm làm chậm toàn bộ nhận UDP |
-| Một thread dài hạn/agent | Dễ hình dung với TCP | UDP không có accept; nhiều thread chờ không cần thiết |
-| Producer–Consumer, fixed workers | Giới hạn CPU/RAM, dễ đo số worker và queue | Có thể xử lý đảo thứ tự; phải kiểm seq + cập nhật nguyên tử |
-| Selector/NIO đầy đủ | Điều phối nhiều socket không blocking | V1 chỉ có một UDP socket; chưa cần tăng độ phức tạp |
+| UdpReceiver / UdpSender | Nhận và gửi datagram; kiểm tra kích thước; quản lý hàng đợi vào/ra | |
+| ProtocolCodec | Mã hóa, giải mã phong bì JSON/base64; kiểm tra kiểu dữ liệu, phiên bản và giới hạn 1.200 byte | |
+| MessageAuthenticator | Xác thực HMAC-SHA256 bằng khóa riêng từng agent; so sánh MAC trong thời gian hằng | |
+| RegistrationService / SessionRegistry | Bắt tay challenge, cấp phiên, lưu endpoint và số thứ tự, thu hồi phiên hết hạn | |
+| ReportService | Áp dụng báo cáo mới, cập nhật trạng thái tài nguyên và thời điểm liên lạc | |
+| AlertEngine | Cảnh báo tài nguyên, ứng dụng và thay đổi online/offline; lưu tối đa 200 sự kiện gần nhất | |
+| RequestTracker | Ghép yêu cầu/phản hồi theo id, quản lý timeout và retry; một lệnh đang chờ trên mỗi agent | |
+| ConsoleView | Hiển thị danh sách máy, thông tin chi tiết, cảnh báo và nhận lệnh quản lý | |
+| AgentRegistration / AgentCommandHandler | Đăng ký phiên; xác thực lệnh; chống xử lý lặp; thay đổi chu kỳ báo cáo | |
+| MetricCollector / ProcessCollector | Thu CPU/RAM/đĩa, thời gian agent hoạt động và danh sách tiến trình có thể quan sát | |
+| SnapshotStore | Giữ danh sách ứng dụng bất biến theo snapshot; phân trang, giới hạn số lượng và thời gian sống | |
+| LoadGenerator / FaultInjector | Tạo agent giả lập, mô phỏng mất/trùng/đảo gói và xuất số liệu kiểm thử | |
 
-Đây là phương án đề xuất đã ghi rõ trade-off, nhóm review trước khi chốt. Nhiều worker không đồng nghĩa chắc chắn nhanh hơn: cập nhật cùng agent vẫn cần tuần tự hóa và có chi phí tranh chấp; phải benchmark.
+Agent và server là hai chương trình độc lập, trao đổi dữ liệu qua LANMON/1 trên UDP. Module common dùng chung định dạng và codec; không chia sẻ trạng thái chạy giữa các tiến trình. Console quản trị nằm trong tiến trình server.
 
-### 2.1 Các thread/task dự kiến
+AlertEngine phát cảnh báo CPU/RAM khi vượt ngưỡng trong 3 báo cáo hợp lệ liên tiếp; mẫu dưới ngưỡng hoặc không lấy được dữ liệu sẽ đặt lại bộ đếm. Cảnh báo cùng loại có khoảng nghỉ 30 giây. Danh sách ứng dụng được lấy bằng GET_APPS; chỉ so sánh các snapshot hoàn tất và xử lý cờ truncated trước khi suy ra ứng dụng đã đóng. Theo dõi tiến trình theo lấy mẫu có thể bỏ lỡ ứng dụng mở rồi đóng giữa hai lần kiểm tra.
 
-| Nơi | Luồng/task | Trách nhiệm |
-|---|---|---|
-| Server | 1 receiver | receive, kiểm chiều dài, copy packet; không parse/hashing/console |
-| Server | WORKER_THREADS=4 | Consumer queue; xác thực, dispatch, cập nhật ngắn theo agent |
-| Server | 1 sender | Lấy outbound queue và gửi UDP bằng cùng socket/cổng nguồn |
-| Server | scheduler | Watchdog mỗi 1 giây, expiry, retry/backoff; không thực hiện tác vụ chờ dài |
-| Server | console reader | Đọc lệnh; đọc snapshot và tạo pending; không chặn receiver/worker để đợi kết quả |
-| Agent | receiver và sender | Nhận, đưa vào inbound queue; gửi qua outbound queue có giới hạn |
-| Agent | bounded worker pool | Xác thực, giữ chỗ request, đọc metric/process và hoàn tất kết quả |
-| Agent | scheduler/collector | Lấy mẫu, gửi REPORT theo fixed-delay, thay lịch khi SET_INTERVAL |
+## 3. Trạng thái dùng chung và an toàn đa luồng
 
-Dùng một UDP socket mỗi tiến trình agent trong suốt phiên; server cũng có một socket. Không tạo socket mới cho từng phản hồi vì sẽ đổi cổng nguồn và phá kiểm tra endpoint. Gửi UDP không tạo một luồng TCP riêng bị nghẽn theo từng client, nhưng socket/queue vẫn có thể quá tải. Sender tách khỏi xử lý nghiệp vụ; không giữ khóa khi gửi. Khi shutdown, đóng socket để giải phóng receive/send đang chờ. Mọi tác vụ đọc OS đều có giới hạn hàng đợi; không dùng common pool vô hạn.
+| Trạng thái dùng chung | Luồng truy cập | Cách bảo vệ | Ghi chú |
+|---|---|---|---|
+| Danh sách agent được phép và khóa xác thực | Worker | Cấu hình bất biến sau khởi động | Tối đa 100 agent; khóa nằm ngoài Git và image |
+| Phiên, challenge và kết quả dừng phiên | Worker, bộ lập lịch | ConcurrentHashMap chứa AgentState; khóa riêng theo agent | Kiểm tra lại sessionId dưới khóa trước khi cập nhật |
+| lastReportSeq, lastContact, intervalMs và dữ liệu tài nguyên | Worker, watchdog, console | Kiểm tra seq và thay snapshot trong cùng khóa AgentState | Gói cũ/trùng không ghi đè dữ liệu hoặc kéo dài thời gian sống |
+| Lệnh đang chờ và commandSeq tại server | Console, worker, bộ lập lịch | Cập nhật nguyên tử dưới khóa AgentState | Hủy timer và hoàn tất future ngoài khóa |
+| Hàng đợi vào/ra | Receiver, worker, sender | ArrayBlockingQueue, offer không chờ | Bỏ gói mới khi đầy và ghi bộ đếm |
+| Bộ đếm nhận, xử lý và bỏ gói | Các luồng, console | LongAdder | Số liệu hiển thị là ảnh chụp tại thời điểm đọc |
+| Phiên và reportSeq tại agent | Reporter, bộ đăng ký, handler | Khóa khi đổi phiên; AtomicReference/AtomicLong cho đọc và tăng số | Phiên mới đặt lại dãy số tương ứng |
+| highestCommandSeq, IN_PROGRESS và cache kết quả | Agent worker, bộ lập lịch | Khóa riêng cho trạng thái lệnh | Giữ chỗ nguyên tử trước khi thực hiện; retry không chạy lệnh lần hai |
+| Snapshot ứng dụng | Bộ thu thập, worker, bộ lập lịch | Danh sách bất biến; khóa ngắn cho map và thao tác hết hạn | Tối đa 2 snapshot sống/phiên, TTL 60 giây |
+| Trạng thái cảnh báo và lịch sử | Worker, console | Trạng thái theo khóa agent; bộ đệm vòng có khóa riêng | Không giữ hai khóa cùng lúc; console đọc bản sao |
 
-## 3. Thành phần và trách nhiệm
+Các thao tác đọc–kiểm tra–ghi trên cùng agent được thực hiện trong một vùng khóa ngắn. Ví dụ worker xử lý REPORT seq 12 trước seq 11 thì báo cáo 11 bị bỏ, kể cả nó được nhận trước tại socket. Khi phiên được thay, worker của phiên cũ không được cập nhật dữ liệu phiên mới.
 
-Tên lớp/module dưới đây là dự kiến, chưa phải file đã có.
+Không giữ khóa khi đọc thông tin hệ điều hành, gửi UDP, ghi console hoặc chạy callback. Mỗi thao tác chỉ khóa một agent; lấy bản sao sự kiện trước khi chuyển sang bộ đệm cảnh báo. Việc giữ chỗ IN_PROGRESS, kiểm seq và tra cache tại agent phải nguyên tử; cache kết quả hoàn tất trước khi đưa phản hồi vào hàng đợi gửi. Chi tiết TTL, retry và giới hạn được quy định trong [đặc tả giao thức](protocol-design.md).
 
-| Thành phần | Trách nhiệm |
-|---|---|
-| ProtocolCodec | Phong bì JSON/base64, UTF-8 nghiêm ngặt, trần 1.200 byte, schema/type/bounds, từ chối khóa trùng |
-| MessageAuthenticator | HMAC-SHA256, chọn key theo agentId, kiểm MAC constant-time; không log khóa |
-| UdpReceiver / UdpSender | I/O và bounded queue; không nhúng nghiệp vụ |
-| RegistrationService | Challenge/confirm, retry bắt tay, giới hạn pending và kết quả, cấp/thu hồi phiên |
-| SessionRegistry | Allowlist agent, endpoint, sessionId, bootId, lastReportSeq, contact deadline |
-| ReportService | Áp REPORT mới nguyên tử, tạo machine snapshot bất biến |
-| AlertEngine | Ngưỡng tài nguyên liên tiếp, hồi phục/cooldown, cảnh báo ứng dụng, ring buffer 200 sự kiện |
-| RequestTracker | Một lệnh pending/agent; id/commandSeq, retry timer, đối chiếu phản hồi, timeout |
-| ConsoleView | Danh sách máy, chi tiết, cảnh báo; GET_REPORT/GET_APPS/SET_INTERVAL/PING |
-| AgentRegistration | bootId và bắt tay, đăng ký lại sau server restart/401 hợp lệ |
-| MetricCollector | CPU/RAM, free bytes volume hệ thống, uptime agent; null khi không hỗ trợ/lỗi |
-| ProcessCollector | Tên tiến trình có thể quan sát, số instance; không đường dẫn/args/nội dung |
-| AgentCommandHandler | Chặn lệnh trái phép, command high-water, IN_PROGRESS và cache kết quả |
-| SnapshotStore | Snapshot ứng dụng bất biến; phân trang theo kích thước wire thực, TTL và giới hạn |
-| LoadGenerator / FaultInjector | Agent giả lập có seed, mất/trùng/đảo gói, đo và xuất CSV; không giả làm dữ liệu thật |
+## 4. Vòng đời kết nối
 
-Không gán chủ sở hữu từ tài khoản GitHub. Bảng thành viên/phân công và README Contribution do nhóm tự hoàn thiện.
-
-## 4. Shared state và an toàn đa luồng
-
-| Dữ liệu dùng chung | Bên truy cập | Cách bảo vệ |
-|---|---|---|
-| Allowlist và khóa từng agent | Worker và khởi động | Cấu hình immutable sau startup; tối đa 100 agent |
-| Session/challenge/tombstone theo agent | Worker, watchdog, console, retry | ConcurrentHashMap chứa AgentState; một khóa riêng ổn định/agent cho cập nhật lifecycle |
-| lastReportSeq, lastContact, interval, machine snapshot | Worker, watchdog, console | Kiểm seq và thay toàn bộ snapshot trong cùng khóa AgentState; console lấy bản immutable rồi nhả khóa |
-| Pending command + commandSeq server | Console, worker, scheduler | Cùng khóa AgentState khi giữ chỗ/hoàn tất; hủy timer, callback/future ngoài khóa |
-| Inbound/outbound queue | Receiver/worker/sender | ArrayBlockingQueue; offer không chờ, kích thước cố định |
-| Counter nhận/xử lý/drop | Các thread và console | LongAdder; số đo là snapshot gần thời điểm, không ép tổng tức thì luôn bằng nhau |
-| Trạng thái agent, interval/reportSeq | Reporter, registration, handler | Session immutable qua AtomicReference; sequence AtomicLong, reset cùng lần đổi session dưới khóa |
-| highestCommandSeq, IN_PROGRESS, cache kết quả tại agent | Agent workers/expiry | Một khóa command; kiểm và giữ chỗ nguyên tử, không có hai worker thực hiện cùng request |
-| Snapshot ứng dụng | Collector/worker/expiry | Danh sách immutable, map có khóa ngắn và TTL/capacity; công bố xong mới cho phân trang |
-| Cảnh báo và lịch sử bounded | Worker và console | Cập nhật theo khóa AgentState; ring buffer riêng chép dữ liệu trước khi hiển thị |
-
-### 4.1 Thứ tự thao tác và tránh deadlock
-
-1. Parse/HMAC ngoài khóa; nguồn cấu hình immutable. Gói đã xác thực vẫn phải được kiểm lại sessionId **trong khóa** trước khi áp dụng, vì worker khác có thể vừa thay phiên.
-2. Khóa duy nhất một AgentState để xác minh endpoint/seq, cập nhật state, tính chuyển trạng thái và tạo mô tả sự kiện/phản hồi. Không khóa hai agent cùng lúc. Không lấy khóa global registry trong lúc giữ khóa agent; cấu hình khóa ổn định theo allowlist giúp tránh đổi lock object khi phiên đổi.
-3. Nhả khóa trước khi serialize/ký phản hồi, offer outbound, ghi log/console hoặc chạy callback. Thông điệp phản hồi gắn sessionId cũ sẽ bị phía nhận bỏ nếu phiên đã đổi.
-4. Lấy mẫu OS/process ngoài khóa. Khi hoàn tất command, kiểm lại session vẫn hiện hành; nếu đã bị thay thì không sửa lịch hoặc công bố kết quả cho phiên mới. SET_INTERVAL chỉ đổi lịch qua thao tác ngắn có kiểm phiên, không giữ khóa qua thao tác đọc OS.
-5. Scheduler expiry không xóa entry IN_PROGRESS đang thực hiện; thao tác đó có ngân sách xử lý, bị hủy/đóng phiên nếu quá hạn để tránh giữ tài nguyên vô hạn. Không xử lý request trùng lần hai khi tác vụ cũ còn chạy.
-
-Worker xử lý REPORT seq 12 trước 11 là hợp lệ; worker 11 phải thấy lastReportSeq=12 và bỏ. Cảnh báo được tính theo thứ tự các báo cáo được chấp nhận, không theo thứ tự socket receive hoặc timestamp máy agent.
-
-### 4.2 Gửi chậm và quá tải
-
-Inbound/outbound đều drop-newest khi đầy. REPORT bị bỏ sẽ được bản mới thay thế; request/reply bị bỏ sử dụng retry §6 giao thức. Kết quả command phải được cache trước khi offer outbound để retry vẫn nhận kết quả mà không lặp tác động. Không dùng queue vô hạn, CallerRunsPolicy trên receiver hoặc chờ CompletableFuture trong worker để đợi mạng.
-
-Tổng số cache/snapshot/pending bị chặn bởi giới hạn theo phiên và số agent. Session hết hạn phải hủy pending, snapshot và kết quả phiên liên quan theo chính sách tombstone. Cùng agent nhiều tiến trình dùng chung khóa/cấu hình sẽ tranh phiên; bản đầu yêu cầu một agent đang hoạt động cho mỗi agentId, không hỗ trợ nhiều thiết bị dùng chung id.
-
-## 5. Vòng đời
-
-### 5.1 Agent
+UDP không có thao tác accept hoặc thông báo EOF. Hệ thống quản lý vòng đời phiên ứng dụng bằng bắt tay, báo cáo định kỳ và timeout.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Unregistered
-    Unregistered --> Registering : Gui REGISTER
-    Registering --> Confirming : Challenge dung va chua het han
-    Confirming --> Active : REGISTER_OK khop request
-    Registering --> Backoff : Timeout hoac BUSY
-    Confirming --> Backoff : Timeout hoac challenge het han
-    Backoff --> Registering : Tao id moi, thu lai co gioi han tan suat
-    Active --> Registering : INVALID_SESSION da xac thuc va khop
-    Active --> Stopping : Nguoi dung dung agent
-    Stopping --> Closed : UNREGISTER co ket qua hoac het retry
+    Unregistered --> Registering : REGISTER
+    Registering --> Confirming : REGISTER_CHALLENGE hợp lệ
+    Confirming --> Active : REGISTER_OK khớp yêu cầu
+    Registering --> Backoff : timeout hoặc BUSY
+    Confirming --> Backoff : timeout hoặc challenge hết hạn
+    Backoff --> Registering : chờ rồi đăng ký lại
+    Active --> Registering : INVALID_SESSION hợp lệ
+    Active --> Stopping : yêu cầu dừng
+    Stopping --> Closed : UNREGISTER có kết quả hoặc hết retry
     Closed --> [*]
 ```
 
-Agent lấy bootId mới khi tiến trình khởi động. Khi chỉ mất phản hồi REPORT thì tiếp tục gửi, không tự tạo phiên mới mỗi chu kỳ. Đăng ký lại hủy pending/snapshot cũ và không nhận kết quả phiên cũ. Trong bắt tay challenge, server giữ phiên cũ cho tới CONFIRM hợp lệ; REGISTER bị replay không tự làm máy đăng ký lại.
+Mỗi lần agent khởi động tạo bootId mới. Server cấp sessionId sau khi kiểm tra REGISTER_CONFIRM hợp lệ; phiên đang hoạt động được giữ trong thời gian chờ challenge. Gói của phiên cũ không làm thay đổi phiên hiện hành. Agent chỉ chấp nhận lệnh từ endpoint server đã cấu hình và có HMAC hợp lệ.
 
-### 5.2 Trạng thái tại server
-
-```mermaid
-stateDiagram-v2
-    [*] --> PendingRegistration
-    PendingRegistration --> Online : CONFIRM hop le va cap session
-    PendingRegistration --> Removed : Challenge het han neu chua co phien
-    Online --> Stale : Qua offline threshold
-    Stale --> Online : REPORT moi hoac ket qua pending hop le
-    Stale --> Expired : Im lang 120 giay
-    Online --> Retired : UNREGISTER hoac phien moi
-    Stale --> Retired : UNREGISTER hoac phien moi
-    Retired --> Removed : Tombstone het han
-    Expired --> Removed : Don state va huy pending
-    Removed --> [*]
-```
-
-Online dùng lastContact, đồng thời giao diện luôn hiển thị tuổi dữ liệu tài nguyên qua lastReportAt. PONG mới có thể xác nhận agent còn phản hồi dù metric đã cũ; không tô metric cũ thành dữ liệu vừa lấy. Không có EOF cho UDP; đóng agent đột ngột chỉ phát hiện qua timeout.
-
-### 5.3 Shutdown server
-
-Đánh dấu stopping, ngừng nhận lệnh console và tạo retry; hủy timer, đóng socket để unblock I/O. Ngừng nhận queue mới, hủy pending bằng thông báo local “server đang dừng”; tác vụ chưa chạy không được thực hiện sau shutdown. Shutdown executor, chờ có deadline tối đa 5 giây, sau đó interrupt/cancel, join receiver/sender, dọn state trong RAM. Không giữ khóa agent khi await termination. Bản đầu không lưu phiên hoặc cache qua restart; agent tự bắt tay lại theo giao thức. Cần kiểm chứng không còn thread giữ JVM chạy sau khi dừng.
-
-## 6. Triển khai và cấu hình
-
-| Chương trình | Cách chạy dự kiến | Địa chỉ/cổng |
+| Tình huống | Phát hiện | Xử lý |
 |---|---|---|
-| Server | Docker Java 21, docker compose up --build | SERVER_HOST=0.0.0.0, SERVER_PORT=5000, publish 5000:5000/udp |
-| Agent demo Docker | Service client của starter, artifact agent | CLIENT_TARGET_HOST=server, CLIENT_TARGET_PORT=5000 |
-| Agent Windows thật | Java 21 native | CLIENT_TARGET_HOST là IP LAN server hoặc localhost; cổng cấu hình |
-| Load generator | Native hoặc container, đánh dấu simulated | Cùng giao thức và khóa thử riêng từng agent |
+| Agent hoạt động bình thường | REPORT seq mới hoặc phản hồi khớp lệnh đang chờ | Cập nhật lastContact; chỉ REPORT mới cập nhật lastReportAt |
+| Agent mất cập nhật | Không có liên lạc mới quá max(10 giây, 3 × chu kỳ báo cáo) | Đánh dấu mất cập nhật; thông báo một lần khi chuyển trạng thái |
+| Agent hoạt động trở lại | Nhận thông điệp mới hợp lệ khi phiên chưa hết hạn | Chuyển online; vẫn hiển thị tuổi dữ liệu tài nguyên riêng |
+| Phiên im lặng 120 giây | Watchdog kiểm tra mỗi giây | Thu hồi phiên, hủy lệnh đang chờ và dọn dữ liệu phiên |
+| Agent dừng chủ động | UNREGISTER hợp lệ | Chuyển offline, trả RESULT; giữ kết quả dừng 60 giây để đáp ứng retry |
+| Server khởi động lại | Agent nhận INVALID_SESSION khớp thông điệp của mình | Đăng ký lại với backoff; bỏ kết quả của phiên cũ |
 
-Server/agent lấy network settings từ môi trường; không commit địa chỉ máy thật. Cấu hình dự kiến bổ sung ở công việc số 2:
+Khi SET_INTERVAL đang chờ, ngưỡng mất cập nhật tính theo chu kỳ lớn hơn giữa giá trị cũ và giá trị yêu cầu. Hết thời gian chờ lệnh chỉ có nghĩa chưa xác nhận được kết quả, vì agent có thể đã thực hiện nhưng phản hồi bị mất.
 
-| Biến | Mặc định / ý nghĩa |
-|---|---|
-| SERVER_HOST, SERVER_PORT | 0.0.0.0 / 5000 |
-| CLIENT_TARGET_HOST, CLIENT_TARGET_PORT | server / 5000 trong Compose; native tự cấu hình |
-| AGENT_ID, AGENT_HOSTNAME | Bắt buộc nhận diện ổn định; không tự dùng username cá nhân |
-| AGENT_KEY_FILE | File khóa agent 32 byte ngoài Git, mount read-only khi dùng Docker |
-| SERVER_KEYS_FILE | Allowlist agentId → key, ngoài Git; không copy vào image |
-| REPORT_INTERVAL_MS | Server cấp 2000 khi đăng ký; SET_INTERVAL runtime trong 1000–10000 |
-| WORKER_THREADS | 4; validate >0 và ghi khi benchmark |
-| INBOUND_QUEUE_CAPACITY, OUTBOUND_QUEUE_CAPACITY | 1024, 1024; cùng giới hạn ở protocol |
-| CPU_ALERT_PCT, RAM_ALERT_PCT | Đề xuất 90, 90; hợp lệ 0..100 |
-| DISK_FREE_ALERT_BYTES | Đề xuất 10 GiB = 10737418240 byte; hợp lệ không âm |
-| ALERT_CONSECUTIVE_REPORTS, ALERT_COOLDOWN_MS | Đề xuất 3 báo cáo hợp lệ và 30000 ms |
-| WATCHED_APPS_FILE | Danh sách tên ứng dụng cấu hình ngoài dữ liệu tiến trình |
-| LOG_LEVEL | INFO; không log khóa/MAC hoặc nguyên danh sách ứng dụng mặc định |
+Khi server dừng, hệ thống ngừng nhận lệnh mới, hủy timer/pending, đóng socket để giải phóng I/O và dừng executor. Thời gian chờ kết thúc các luồng tối đa 5 giây trước khi yêu cầu ngắt tác vụ còn lại. Các thao tác chờ kết thúc không giữ khóa agent. Phiên và cache chỉ nằm trong RAM, không được khôi phục sau khi tiến trình khởi động lại.
 
-Chu kỳ thay đổi có hiệu lực trong RAM, không tự ghi đè biến môi trường; agent/server restart quay về mặc định REGISTER_OK. Các TTL, trần gói và giới hạn phiên/ảnh chụp theo LANMON/1 phải đồng nhất. .env.example/Compose hiện còn là starter, chưa tuyên bố các biến hoặc image trên đã triển khai.
+## 5. Triển khai
 
-Cấu trúc Maven dự kiến: common (codec/auth/schema), server, agent, loadtest. Bước dựng module là công việc số 2, chưa làm trong lần viết tài liệu này. Thư mục client/shared hiện có của starter sẽ được đối chiếu/sắp xếp khi dựng module; service Compose client vẫn có thể trỏ artifact agent để theo hướng dẫn môn học.
+| Container / chương trình | Image / ngôn ngữ | Cổng | Cấu hình |
+|---|---|---|---|
+| server | Java 21, Docker image của nhóm | 5000/UDP, publish 5000:5000/udp | SERVER_HOST=0.0.0.0, SERVER_PORT=5000 |
+| client — agent demo trong Docker | Java 21 | Cổng nguồn UDP cấp động, giữ nguyên trong phiên | CLIENT_TARGET_HOST=server, CLIENT_TARGET_PORT=5000 |
+| Agent Windows native | Java 21 trên máy được giám sát | Cổng nguồn UDP cấp động | CLIENT_TARGET_HOST là địa chỉ LAN server; CLIENT_TARGET_PORT |
+| Load generator | Java 21, native hoặc Docker | UDP theo cấu hình đích | Agent giả lập có mã và khóa thử riêng |
 
-Đo CPU/RAM trong container có thể khác tài nguyên host; demo Windows dùng agent native và ghi rõ nguồn dữ liệu. Khóa HMAC không mã hóa telemetry; v1 chỉ dùng LAN được quản lý và sự đồng ý rõ ràng. Không thu website/nội dung/keystroke và không nhận lệnh hệ điều hành tùy ý.
+Server được đóng gói để khởi động bằng `docker compose up --build`. Cấu hình mạng lấy từ biến môi trường và được liệt kê trong `.env.example`. Khóa được cấp sẵn qua AGENT_KEY_FILE và SERVER_KEYS_FILE, mount chỉ đọc khi chạy Docker; không lưu khóa trong mã nguồn hoặc image. Mỗi agentId chỉ có một tiến trình agent hoạt động tại một thời điểm.
 
-## 7. Cảnh báo và hiển thị
+WORKER_THREADS mặc định 4; INBOUND_QUEUE_CAPACITY và OUTBOUND_QUEUE_CAPACITY mặc định 1024. REPORT_INTERVAL_MS mặc định 2000, được server xác nhận khi đăng ký; lệnh SET_INTERVAL chỉ thay giá trị trong RAM. Ngưỡng CPU/RAM mặc định 90%, ổ đĩa còn dưới 10 GiB sẽ cảnh báo; các ngưỡng và danh sách ứng dụng cần chú ý được cấu hình riêng.
 
-REPORT chấp nhận cập nhật metric nguyên tử. Cảnh báo CPU/RAM chỉ khi vượt ngưỡng đủ 3 mẫu hợp lệ liên tiếp; một mẫu dưới ngưỡng hoặc null reset chuỗi vượt ngưỡng. Cảnh báo được gộp theo (agent, loại), cooldown 30 giây; thông báo hồi phục khi có mẫu hợp lệ dưới ngưỡng. Disk free thấp cảnh báo từ mẫu hợp lệ; null chỉ hiển thị không hỗ trợ/lỗi đọc. Offline/online tạo sự kiện khi chuyển trạng thái, không spam mỗi lần watchdog.
+Agent Windows chạy native để đo tài nguyên máy thật. Agent trong container dùng cho thử nghiệm giao thức; số liệu thu được phụ thuộc môi trường container và phải được phân biệt khi báo cáo. HMAC xác thực thông điệp nhưng không mã hóa nội dung; hệ thống sử dụng trong LAN được quản lý và trên máy có sự đồng ý của người dùng.
 
-Ứng dụng được lấy qua GET_APPS theo yêu cầu; so hai snapshot hoàn tất để ghi nhận mở/đóng quan sát được. Chỉ suy ra đóng nếu snapshot mới không bị truncated; snapshot lỗi/hết hạn/tải dở không tạo sự kiện đóng hàng loạt. Cảnh báo ứng dụng thuộc danh sách cấu hình khi quan sát thấy; không nhận định người dùng đã truy cập nội dung gì. Nhìn ứng dụng tự động liên tục chỉ thêm sau nếu nhóm chốt chu kỳ, giới hạn request và ngân sách tải.
+## 6. Các quyết định thiết kế
 
-## 8. Kiểm thử và đo tải dự kiến
+| Quyết định | Phương án đã cân nhắc | Lý do chọn |
+|---|---|---|
+| Thread pool kết hợp Producer–Consumer | Xử lý trong receiver; một luồng/agent; event loop | Tách nhận gói khỏi xử lý, giới hạn tài nguyên và phù hợp bài toán một socket UDP nhận nhiều agent. |
+| LANMON/1 trên UDP | TCP cho toàn bộ dữ liệu | Báo cáo ưu tiên trạng thái mới nhất; lệnh cần phản hồi có retry và chống trùng riêng. |
+| Khóa ngắn theo agent và snapshot bất biến | Một khóa chung cho mọi agent; cập nhật nhiều collection rời rạc | Bảo vệ thao tác kiểm seq–cập nhật mà không khóa toàn bộ hệ thống. |
+| Luồng gửi riêng và hàng đợi hữu hạn | Gửi trong vùng khóa; hàng đợi không giới hạn | Không giữ khóa khi làm I/O, kiểm soát bộ nhớ khi quá tải. |
+| Challenge, sessionId và hai dãy seq | Đăng ký một gói; dùng chung seq cho báo cáo và lệnh | Phân biệt restart, hạn chế replay đăng ký và tránh bỏ nhầm lệnh khi REPORT đến trước. |
+| JSON/base64 với HMAC | Binary; chuẩn hóa JSON trước khi ký | Dễ kiểm tra dữ liệu logic và xác định chính xác byte được xác thực; chấp nhận phần dữ liệu tăng thêm do base64. |
+| Snapshot ứng dụng có phân trang và TTL | Gửi toàn bộ danh sách; lấy lại tiến trình cho từng trang | Giữ datagram dưới trần kích thước và bảo đảm các trang thuộc cùng một danh sách. |
+| Một server, console và trạng thái trong RAM | GUI, cơ sở dữ liệu, nhiều server | Tập trung triển khai giao thức và xử lý đồng thời; giảm yêu cầu lưu trữ và đồng bộ. |
 
-| Nhóm | Cách kiểm chứng cần triển khai |
-|---|---|
-| Codec/auth | UTF-8, duplicate keys, sai kiểu, HMAC sai, payload vượt 1200, khóa unknown, direction sai |
-| Phiên | Challenge cũ/expired/retry, hai REGISTER cạnh tranh, server restart, đổi endpoint, gói phiên cũ |
-| REPORT | Mất/trùng/đảo seq, hai worker cùng cập nhật, seq vượt giới hạn, metric null và đơn vị |
-| Lệnh | Mất request/result, retry cùng id, id khác body, IN_PROGRESS, seq cũ sau cache expiry, TTL/capacity, timeout chưa rõ kết quả |
-| Snapshot | UTF-8 tên dài, đầy đủ trang trong 1200 byte, thay tiến trình giữa trang, snapshot rỗng/truncated/hết hạn |
-| Liveness/shutdown | Agent kill, silent, đổi interval, UNREGISTER mất phản hồi, socket và worker đóng đúng deadline |
-| Tải | 10/50/100 agent; 1 và 4 worker; queue/rate giữ tương đương; warm-up 10s, đo 60s, tối thiểu 3 lần mỗi cấu hình chọn |
-| LAN/Docker | Hai máy thật, nhiều agent, clean build Docker, firewall UDP và Wireshark |
-
-Counter dự kiến: received, oversize, inboundDropped, malformed, authRejected, invalidSession, duplicateReport, staleReport, processed, outboundDropped, retryCount, requestTimeout. Độ trễ xử lý đo trong một tiến trình từ enqueue đến xử lý xong; RTT lệnh đo ở server từ lần gửi đầu đến kết quả và ghi số retry. Không gọi thời gian report agent→server là độ trễ một chiều chính xác khi đồng hồ chưa đồng bộ.
-
-FaultInjector ở mức ứng dụng dùng seed tái lập, chỉ giữ tối đa số gói trì hoãn cấu hình; không dùng timer/queue vô hạn để tạo lỗi thử nghiệm. Phải ghi rõ đây là mô phỏng ứng dụng, không giả nhận đã thay toàn bộ điều kiện mạng. Counter khoảng trống seq chỉ là ước lượng sau cửa sổ quan sát, không đồng nhất tức thì với mất trên mạng.
-
-Ghi kết quả chạy thật vào docs/testing-guide.md sau khi triển khai. Tài liệu này không thay thế test và không khẳng định các mức tải đã đạt. M1 chỉ chốt đề xuất; M2 cần skeleton Docker chạy; M3 cần tính năng và minh chứng.
-
-## 9. Quyết định và phần nhóm cần review
-
-Phạm vi Java 21 + Windows + console + khóa riêng từng agent đã được xác nhận trong trao đổi. Phần thiết kế cụ thể đang đề xuất để nhóm review: phong bì base64/HMAC, challenge đăng ký, hai dãy seq, một pending/agent, snapshot 60 giây/256 mục, giới hạn queue/cache và ngưỡng cảnh báo. Chọn các phương án này nhằm giữ giao thức hữu hạn và có thể kiểm thử, không làm một bản TCP hay điều khiển máy từ xa thu nhỏ.
-
-Không thêm GUI, DB hoặc tính năng ngoài phạm vi để tăng số lệnh. Khi nhóm thay hợp đồng mạng, cập nhật protocol-design.md cùng lúc; khi thay mô hình khóa, cập nhật bảng shared state và bài test cạnh tranh. Bảng phân công/đóng góp và phần tự kiểm chứng AI do nhóm tự ghi nhận.
+Hiệu quả của số worker và giới hạn hàng đợi được đánh giá bằng thử nghiệm 10/50/100 agent. Mỗi cấu hình đo có thời gian khởi động ổn định 10 giây, thời gian lấy số liệu 60 giây và ít nhất 3 lần chạy. Các chỉ số gồm số gói nhận/xử lý/bỏ, độ trễ xử lý trong server và RTT lệnh. Kết quả thực nghiệm được ghi trong `docs/testing-guide.md`.

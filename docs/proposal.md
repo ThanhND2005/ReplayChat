@@ -40,12 +40,18 @@ UDP có thể mất, trùng hoặc đảo thứ tự gói. Báo cáo dùng số 
 
 ## 7. Phương án đã cân nhắc
 
-| Lựa chọn đề xuất | Phương án khác | Đánh đổi cần nhóm xác nhận |
+| Phương án | Có chọn không? | Lý do chọn / không chọn |
 |---|---|---|
-| UDP và độ tin cậy có chọn lọc | TCP cho toàn bộ | Có bài toán mất/trùng/đảo gói để thực nghiệm; phải tự thiết kế retry và giới hạn tải |
-| Console, một server | GUI, nhiều server | Giảm thời gian giao diện/vận hành, tập trung giao thức |
-| JSON và HMAC trên byte payload | Binary hoặc JSON canonical | Dễ đọc; phong bì base64 tốn byte nhưng tránh ký sai vì thứ tự khóa/cách biểu diễn số |
-| Producer–Consumer | Xử lý hết trên receiver | Giới hạn tài nguyên, tách nhận gói khỏi xử lý; cần bảo vệ seq khi worker chạy song song |
+| UDP với độ tin cậy có chọn lọc | Có | Báo cáo định kỳ ưu tiên dữ liệu mới; chỉ bổ sung retry/chống trùng cho lệnh cần kết quả. |
+| TCP cho toàn bộ thông điệp | Không | Đơn giản hơn về độ tin cậy, nhưng không thể hiện trực tiếp bài toán mất/trùng/đảo datagram là trọng tâm đề tài. |
+| Console và một server | Có | Giảm thời gian giao diện/vận hành, tập trung vào giao thức và xử lý nhiều agent. |
+| GUI và nhiều server | Không | Tăng phạm vi, yêu cầu thêm đồng bộ và xử lý sự cố; chưa cần cho bài toán LAN nhỏ. |
+| JSON trong phong bì base64 có HMAC | Có | Dễ đọc dữ liệu logic, xác định chính xác byte cần ký; chấp nhận overhead base64. |
+| Binary hoặc chuẩn hóa JSON trước khi ký | Không | Có thể tiết kiệm byte hoặc tránh base64 nhưng tăng công thiết kế/đồng bộ định dạng so với phạm vi v1. |
+| Producer–Consumer với worker cố định | Có | Tách nhận gói khỏi xử lý, giới hạn queue/worker và kiểm soát tài nguyên. |
+| Xử lý toàn bộ nghiệp vụ trong receiver | Không | Tác vụ chậm cản việc nhận báo cáo từ các agent khác. |
+
+Các lựa chọn trên là phương án thiết kế đề xuất để nhóm review; chưa phải kết luận hiệu năng từ thực nghiệm.
 
 ## 8. Phân công dự kiến
 
